@@ -703,6 +703,9 @@
   .diff-note{font-size:0.75rem;color:var(--muted);margin-top:6px;line-height:1.5;}
   /* ---- 방수산업기사 병합 앱 추가 스타일 ---- */
   .toast{position:fixed;left:50%;bottom:90px;transform:translate(-50%,20px);background:rgba(20,20,24,0.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:0.85rem;font-weight:600;opacity:0;pointer-events:none;transition:opacity 0.25s ease, transform 0.25s ease;z-index:999;}
+  .version-update-banner{position:fixed;left:0;right:0;top:0;z-index:100000;background:#164a5e;color:#fff;display:flex;align-items:center;justify-content:center;gap:14px;padding:11px 16px;font-size:0.85rem;font-weight:700;box-shadow:0 2px 10px rgba(0,0,0,0.2);}
+  .version-update-banner .vub-text{cursor:pointer;text-decoration:underline;text-underline-offset:3px;}
+  .version-update-banner .vub-close{cursor:pointer;opacity:0.75;font-weight:400;padding:0 4px;}
   .toast.show{opacity:1;transform:translate(-50%,0);}
   .tag.pts{background:var(--rose-soft,#f5e6df);color:var(--rose,#a1503c);}
   .swipe-hint{text-align:center;font-size:0.72rem;color:var(--muted);margin-top:10px;opacity:0.7;}
@@ -1027,7 +1030,7 @@
        세 가지 다 파일을 건드릴 때마다 이 주석부터 확인할 것.
    [3] 엔진 수정 후에는 곧바로 배포본을 만들지 말고, 무엇을 고쳤는지 먼저 설명하고
        사용자 컨펌을 받은 뒤에만 배포본(들)을 새로 만든다. */
-const APP_VERSION = "2026.08.26_12:34";
+const APP_VERSION = "2026.08.26_23:29";
 
 /* ============ PWA 설치(앱처럼 구동) ============ */
 (function(){
@@ -1905,6 +1908,63 @@ function voiceErrorInfo(code){
       return {fatal:true, msg:`🎙️ 음성 인식 오류(${code||"알수없음"})가 발생했어요. 다시 시도해주세요.`};
   }
 }
+/* ---- 음성인식 세션이 짧게 끊겼다 재시작될 때, 마이크 버퍼가 덜 비워진 채로 겹쳐서
+   직전 세션과 내용이 겹치는 문장을 다시 인식하는 경우가 있다(예: "나도" → "나도 몰라" →
+   "나도 몰라"). 새 세그먼트를 그냥 추가하지 않고, 직전 세그먼트와의 포함 관계를 먼저 확인해서
+   완전 중복은 버리고, 이전 내용을 포함하는 확장판이면 교체한다. ---- */
+/* ---- 표현이 살짝 다르게(예: "믹스"→"맥스") 다시 인식된 경우까지 잡기 위해,
+   완전 일치/포함관계가 아니어도 "단어 대부분이 겹치면 사실상 같은 말"로 본다. ---- */
+function wordOverlapRatio(a, b){
+  const wa = a.split(/\s+/).filter(Boolean);
+  const wb = b.split(/\s+/).filter(Boolean);
+  if(!wa.length || !wb.length) return 0;
+  const setA = new Set(wa);
+  let common = 0;
+  wb.forEach(w=>{ if(setA.has(w)) common++; });
+  return common / Math.max(wa.length, wb.length);
+}
+const VOICE_DUP_OVERLAP_THRESHOLD = 0.6; // 단어의 60% 이상 겹치면 "같은 말 다시 말한 것"으로 본다
+function pushVoiceSegment(segments, newSeg){
+  const seg = (newSeg||"").trim();
+  if(!seg) return;
+  if(!segments.length){ segments.push(seg); return; }
+  const last = segments[segments.length-1];
+  const lastNorm = last.replace(/\s+/g,"");
+  const segNorm = seg.replace(/\s+/g,"");
+  if(segNorm === lastNorm) return; // 완전히 같은 내용 → 버림
+  if(segNorm.includes(lastNorm)){ segments[segments.length-1] = seg; return; } // 이전 내용을 포함하는 확장판 → 교체
+  if(lastNorm.includes(segNorm)) return; // 이전 내용의 부분집합(더 짧게 잘린 것) → 버림
+  if(wordOverlapRatio(last, seg) >= VOICE_DUP_OVERLAP_THRESHOLD){
+    // 표현은 조금 다르지만 사실상 같은 말을 다시 한 것 → 더 긴(더 자세한) 쪽으로 교체
+    segments[segments.length-1] = seg.length >= last.length ? seg : last;
+    return;
+  }
+  segments.push(seg);
+}
+/* ---- 세션 "안에서도" 일부 기기(특히 안드로이드 크롬 계열)는 e.results에 같은 말을
+   점점 길어지는 여러 개의 확정(isFinal) 조각으로 반복해서 채워넣는 경우가 있다
+   ("그걸로" → "그걸로 한" → "그걸로 한 거구나" 처럼 매번 처음부터 다시).
+   단순히 다 이어붙이면 그대로 중복되므로, pushVoiceSegment와 같은 포함관계 판단으로
+   한 세션 안의 조각들도 병합한다. ---- */
+function mergeGrowingPieces(pieces){
+  let acc = "";
+  for(const raw of pieces){
+    const piece = (raw||"").trim();
+    if(!piece) continue;
+    if(!acc){ acc = piece; continue; }
+    const accNorm = acc.replace(/\s+/g,"");
+    const pieceNorm = piece.replace(/\s+/g,"");
+    if(pieceNorm === accNorm) continue;
+    if(pieceNorm.includes(accNorm)){ acc = piece; continue; } // 확장판 → 교체
+    if(accNorm.includes(pieceNorm)) continue; // 부분집합 → 버림
+    if(wordOverlapRatio(acc, piece) >= VOICE_DUP_OVERLAP_THRESHOLD){
+      acc = piece.length >= acc.length ? piece : acc; // 표현만 다른 재인식 → 더 긴 쪽 채택
+      continue;
+    }
+    acc += (acc?" ":"") + piece; // 진짜 별개의 문장 → 이어붙임
+  }
+  return acc;
+}
 function setupVoicePad(q){
   const ta = document.getElementById("voicePadTextarea");
   const clearBtn = document.getElementById("voicePadClearBtn");
@@ -1930,21 +1990,37 @@ function setupVoicePad(q){
   } else {
     let recognizing = false;
     let recognizer = null;
-    let committedText = ""; // 이미 확정된 텍스트(녹음 시작 전 기존 값 + 지금까지 확정된 문장들)
+    let baseText = ""; // 녹음 시작 전 입력창에 이미 있던 텍스트
+    let finalSegments = []; // 인식 세션이 끝날 때마다 "그 세션이 확정한 문장"을 하나씩 통째로 담는다
+    let restartCount = 0; // 재시작할 때마다 안드로이드의 시작/종료 알림음("삑삑")이 들리므로,
+                           // 재시작이 계속 이어지면 텀을 점점 늘려서 그 소리 빈도 자체를 줄인다.
+    const nextRestartDelay = ()=> Math.min(800 + restartCount*600, 2600);
+    const renderText = (sessionFinal, sessionInterim)=>{
+      // 화면에 보여줄 텍스트는 매번 (기존 텍스트 + 확정된 세그먼트들 + 지금 세션의 확정/중간 결과)를
+      // 처음부터 다시 조립한다. ta.value를 읽어서 그 위에 또 쌓지 않기 때문에(이전 방식의 문제),
+      // 세션이 여러 번 끊겼다 이어져도 같은 말이 중복으로 쌓이지 않는다.
+      const parts = [baseText.trim(), ...finalSegments, sessionFinal].filter(Boolean);
+      let text = parts.join(" ");
+      if(sessionInterim) text += (text?" ":"") + sessionInterim;
+      ta.value = text;
+      state.voiceMemos[q.id] = text;
+    };
     const startSession = ()=>{
       recognizer = new SR();
       recognizer.lang = "ko-KR";
       recognizer.interimResults = true;
       recognizer.continuous = true;
+      let sessionFinal = "", sessionInterim = "";
       recognizer.onresult = (e)=>{
-        let finalTxt = "", interimTxt = "";
-        for(let i=0;i<e.results.length;i++){
-          const r = e.results[i];
-          if(r.isFinal) finalTxt += r[0].transcript;
-          else interimTxt += r[0].transcript;
+        let finalPieces = [], i = "";
+        for(let idx=0; idx<e.results.length; idx++){
+          const r = e.results[idx];
+          if(r.isFinal) finalPieces.push(r[0].transcript);
+          else i += r[0].transcript;
         }
-        ta.value = committedText + finalTxt + interimTxt;
-        state.voiceMemos[q.id] = ta.value;
+        sessionFinal = mergeGrowingPieces(finalPieces);
+        sessionInterim = i;
+        renderText(sessionFinal, sessionInterim);
       };
       recognizer.onerror = (e)=>{
         const info = voiceErrorInfo(e && e.error);
@@ -1955,17 +2031,20 @@ function setupVoicePad(q){
       };
       recognizer.onend = ()=>{
         if(!recognizing) return;
-        // 이 세션에서 확정된 부분을 누적해두고(끊어 말해도 앞 내용이 사라지지 않도록),
-        // 새 인식 세션을 이어서 시작한다. (브라우저가 계속듣기 모드에서도 종종 세션을 스스로 끊기 때문)
-        if(ta.value && ta.value.length > committedText.length){
-          committedText = ta.value.endsWith(" ") ? ta.value : ta.value + " ";
-        }
-        try{ startSession(); }catch(e){}
+        // 이 세션이 확정한 문장을 통째로 배열에 담아둔다(끊어 말해도 앞 내용이 사라지지 않도록).
+        if(sessionFinal) pushVoiceSegment(finalSegments, sessionFinal);
+        // 끝나자마자 바로 재시작하면 마이크 버퍼가 덜 정리된 채로 겹쳐서, 같은 말이
+        // 여러 번 중복 인식되는 문제가 있었다. 재시작 텀을 두고, 재시작이 반복될수록
+        // 그 텀을 점점 늘려서(안드로이드 알림음이 너무 잦지 않도록) 재시작 자체를 줄인다.
+        restartCount++;
+        setTimeout(()=>{ if(recognizing){ try{ startSession(); }catch(e){} } }, nextRestartDelay());
       };
       recognizer.start();
     };
     const startRec = ()=>{
-      committedText = ta.value ? (ta.value + " ") : "";
+      baseText = ta.value || "";
+      finalSegments = [];
+      restartCount = 0;
       startSession();
       recognizing = true;
       recBtn.classList.add("recording");
@@ -3964,10 +4043,23 @@ function listenForVoiceAnswer(q, session){
   setRecBtnRecording(true);
   voiceStudyAutoListening = true; // 수동 녹음 버튼과 동시에 두 개의 인식기가 뜨는 것을 막기 위한 표시
   let gotSpeech = false;
-  let committedText = "";
   let answered = false; // revealAndSpeakVoiceAnswer 중복 호출 방지
+  let restartCount = 0; // 재시작마다 안드로이드 알림음("삑삑")이 들리므로, 반복될수록 텀을 늘려서 빈도를 줄인다.
+  const nextRestartDelay = ()=> Math.min(800 + restartCount*600, 2600);
   const ta = document.getElementById("voicePadTextarea");
-  if(ta){ committedText = ta.value ? (ta.value + " ") : ""; }
+  const baseText = ta ? (ta.value || "") : "";
+  let finalSegments = []; // 인식 세션이 끝날 때마다 "그 세션이 확정한 문장"을 하나씩 통째로 담는다
+  const renderText = (sessionFinal, sessionInterim)=>{
+    // ta.value를 읽어서 그 위에 또 쌓지 않고, 매번 처음부터 다시 조립한다.
+    // (예전 방식은 세션이 끊겼다 이어질 때 같은 말이 중복으로 쌓이는 문제가 있었음)
+    if(!ta) return;
+    const parts = [baseText.trim(), ...finalSegments, sessionFinal].filter(Boolean);
+    let text = parts.join(" ");
+    if(sessionInterim) text += (text?" ":"") + sessionInterim;
+    ta.value = text;
+    if(!state.voiceMemos) state.voiceMemos = {};
+    state.voiceMemos[q.id] = text;
+  };
 
   const proceedToAnswer = ()=>{
     if(answered) return;
@@ -3992,32 +4084,37 @@ function listenForVoiceAnswer(q, session){
   let noSpeechTimer = null;   // 아직 한마디도 안 한 상태에서 "이 시간까지 말 안 하면 넘어간다"
   let silenceTimer = null;    // 말을 시작한 뒤 "이만큼 조용하면 말이 끝난 것으로 보고 넘어간다"
   let safetyTimer = null;
+  let nextDeadline = 0; // 다음으로 proceedToAnswer가 예정된 시각(ms) — 재시작 필요 여부 판단용
   const armTimers = ()=>{
     // 마이크가 실제로 켜진 순간(recognizer.onstart)부터 타이머를 시작한다.
     // 그 전(마이크 권한 확인·초기화하는 짧은 시간)까지 대기시간에 포함시키면
     // 실제로 말할 수 있는 시간이 그만큼 줄어들어 답변을 자꾸 놓치게 된다.
     if(noSpeechTimer) clearTimeout(noSpeechTimer);
+    const ms = voiceStudyListenMs();
+    nextDeadline = Date.now() + ms;
     noSpeechTimer = setTimeout(()=>{
       noSpeechTimer = null;
       if(!gotSpeech) proceedToAnswer(); // 아직 한마디도 안 했으면 여기서 바로 정답으로 진행
-    }, voiceStudyListenMs());
+    }, ms);
     // 만에 하나 음성인식 이벤트가 하나도 안 들어오는 등 예외적인 상황에서도 흐름이 멈추지 않도록
     // 최대 대기시간(듣기 + 답변후 대기 + 여유 30초)이 지나면 무조건 정답 단계로 진행시키는 안전장치.
     // (말을 길게 이어가는 경우까지 감안해 여유를 넉넉히 둠)
     if(safetyTimer) clearTimeout(safetyTimer);
     safetyTimer = setTimeout(()=>{
       proceedToAnswer();
-    }, voiceStudyListenMs() + voiceStudyPostAnswerGapMs() + 30000);
+    }, ms + voiceStudyPostAnswerGapMs() + 30000);
   };
   // 말이 감지된 뒤, "이만큼 조용하면 말이 끝난 것"으로 보고 다음 단계로 넘어간다.
   // 말하는 도중 잠깐 쉬어도(문장 사이 숨 고르기 등) 여기서 다시 타이머를 새로 걸기 때문에
   // 말이 끝나기 전에 잘려서 넘어가는 일이 없다.
   const armSilenceTimer = ()=>{
     if(silenceTimer) clearTimeout(silenceTimer);
+    const ms = voiceStudyPostAnswerGapMs();
+    nextDeadline = Date.now() + ms;
     silenceTimer = setTimeout(()=>{
       silenceTimer = null;
       proceedToAnswer();
-    }, voiceStudyPostAnswerGapMs());
+    }, ms);
   };
   // 혹시 onstart가 지원되지 않는 브라우저를 대비해, 즉시 한 번 타이머를 걸어둔다.
   // (onstart가 정상적으로 뜨는 브라우저에서는 armTimers()가 다시 호출되며 시간을 리셋함)
@@ -4029,6 +4126,7 @@ function listenForVoiceAnswer(q, session){
     recognizer.lang = "ko-KR";
     recognizer.interimResults = true;
     recognizer.continuous = true;
+    let sessionFinal = "", sessionInterim = "";
     recognizer.onstart = ()=>{
       if(session !== voiceSessionToken) return;
       if(!gotSpeech) armTimers(); // 마이크가 진짜로 열린 시점부터 "무응답" 대기시간을 다시 센다
@@ -4039,17 +4137,15 @@ function listenForVoiceAnswer(q, session){
       if(noSpeechTimer){ clearTimeout(noSpeechTimer); noSpeechTimer = null; }
       gotSpeech = true;
       armSilenceTimer(); // 말이 들어올 때마다(중간중간 쉬어도) 침묵 타이머를 계속 새로 건다
-      let finalTxt = "", interimTxt = "";
-      for(let i=0;i<e.results.length;i++){
-        const r = e.results[i];
-        if(r.isFinal) finalTxt += r[0].transcript;
-        else interimTxt += r[0].transcript;
+      let finalPieces = [], i = "";
+      for(let idx=0; idx<e.results.length; idx++){
+        const r = e.results[idx];
+        if(r.isFinal) finalPieces.push(r[0].transcript);
+        else i += r[0].transcript;
       }
-      if(ta){
-        ta.value = committedText + finalTxt + interimTxt;
-        if(!state.voiceMemos) state.voiceMemos = {};
-        state.voiceMemos[q.id] = ta.value;
-      }
+      sessionFinal = mergeGrowingPieces(finalPieces);
+      sessionInterim = i;
+      renderText(sessionFinal, sessionInterim);
       if(statusEl) statusEl.textContent = "듣고 있어요…";
     };
     let lastErrorInfo = null;
@@ -4062,9 +4158,8 @@ function listenForVoiceAnswer(q, session){
       voiceStudyRecognizer = null;
       if(answered) return;
       if(voicePaused) return; // 일시정지 중이면 재개 시 처리
-      if(ta && ta.value && ta.value.length > committedText.length){
-        committedText = ta.value.endsWith(" ") ? ta.value : ta.value + " ";
-      }
+      // 이 세션이 확정한 문장을 통째로 배열에 담아둔다(끊어 말해도 앞 내용이 사라지지 않도록).
+      if(sessionFinal) pushVoiceSegment(finalSegments, sessionFinal);
       // 권한 거부·마이크 없음·네트워크 문제처럼 다시 시도해도 똑같이 실패할 오류라면,
       // 무한히 재시도하지 않고 바로 정답 단계로 넘어간다(사용자에게는 이미 원인 메시지를 보여준 상태).
       if(lastErrorInfo && lastErrorInfo.fatal){
@@ -4075,7 +4170,19 @@ function listenForVoiceAnswer(q, session){
       // 말을 이미 시작했든 안 했든, 여기서 곧바로 "끝났다"고 단정 짓지 않고
       // 항상 새 인식 세션을 이어서 시작해 계속 듣는다. 실제로 넘어갈지 말지는
       // armTimers()/armSilenceTimer()가 관리하는 타이머들이 결정한다.
-      try{ startSession(); }catch(e){ proceedToAnswer(); }
+      // 다만 재시작마다 안드로이드 시작/종료 알림음("삑삑")이 들리므로:
+      // ① 대기시간이 곧(1.2초 이내) 끝날 예정이면 굳이 재시작하지 않고 그냥 그 타이머가 끝나게 둔다.
+      // ② 재시작이 반복될수록 텀을 점점 늘려서(백오프) 알림음 빈도 자체를 줄인다.
+      restartCount++;
+      const remain = nextDeadline - Date.now();
+      if(remain < 1200){
+        // 곧 어차피 다음 단계로 넘어갈 시점이라, 재시작하지 않고 기존 타이머에 맡긴다.
+        return;
+      }
+      setTimeout(()=>{
+        if(session !== voiceSessionToken || answered || voicePaused) return;
+        try{ startSession(); }catch(e){ proceedToAnswer(); }
+      }, nextRestartDelay());
     };
     try{ recognizer.start(); }catch(e){
       proceedToAnswer();
@@ -6784,6 +6891,39 @@ document.addEventListener("click", (e)=>{
 });
 
 render();
+
+/* ---- 새 버전 자동 감지: GitHub Pages/브라우저 캐시 때문에 배포 직후에도 옛날 화면이
+   계속 보이는 문제를 줄이기 위해, 주기적으로 캐시를 건너뛰고 같은 주소를 다시 받아와
+   APP_VERSION을 비교한다. 다르면 화면 하단에 배너를 띄우고, 누르면 캐시 무시하고 새로고침한다. ---- */
+(function(){
+  async function checkForNewVersion(){
+    try{
+      const res = await fetch(location.pathname + location.search, { cache: "no-store" });
+      if(!res.ok) return;
+      const text = await res.text();
+      const m = text.match(/const APP_VERSION = "([^"]*)"/);
+      if(m && m[1] && m[1] !== APP_VERSION) showUpdateBanner();
+    }catch(e){ /* 오프라인 등은 조용히 무시 */ }
+  }
+  function showUpdateBanner(){
+    if(document.getElementById("versionUpdateBanner")) return;
+    const bar = document.createElement("div");
+    bar.id = "versionUpdateBanner";
+    bar.className = "version-update-banner";
+    bar.innerHTML = `<span class="vub-text">🔄 새 버전이 있어요 · 탭해서 새로고침</span><span class="vub-close">✕</span>`;
+    bar.querySelector(".vub-text").addEventListener("click", ()=>{
+      const url = new URL(location.href);
+      url.searchParams.set("v", Date.now()); // 캐시를 우회하기 위한 값
+      location.href = url.toString();
+    });
+    bar.querySelector(".vub-close").addEventListener("click", (e)=>{
+      e.stopPropagation();
+      bar.remove();
+    });
+    document.body.appendChild(bar);
+  }
+  setTimeout(checkForNewVersion, 4000); // 앱 켤 때 한 번만 확인
+})();
 </script>
 
 
